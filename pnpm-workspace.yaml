@@ -14,3 +14,8 @@ allowBuilds:
   workerd: false
 minimumReleaseAgeExclude:
   - '@danmaku-anywhere/*'
+# Temporary: the extension-protocol 0.2.0 preview tarball, built from the
+# monorepo branch feat/kazumi-api-mode. Remove this override and reinstall
+# once 0.2.0 is published to npm.
+overrides:
+  '@danmaku-anywhere/extension-protocol': https://raw.githubusercontent.com/rinnki-L/web/ci-artifacts/artifacts/danmaku-anywhere-extension-protocol-0.2.0.tgz
