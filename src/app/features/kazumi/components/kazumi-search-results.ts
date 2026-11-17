@@ -33,10 +33,6 @@ import { KazumiService } from '../services/kazumi.service'
   ],
   template: `
     <div>
-      @if (!$isRunnable()) {
-        <p class="p-4">该规则使用 API 模式，当前版本暂不支持搜索</p>
-      }
-
       @if (searchQuery.isFetching()) {
         @for (i of [1, 2, 3]; track i) {
           <p-skeleton styleClass="my-2" width="100%" height="76px" />
@@ -48,6 +44,11 @@ import { KazumiService } from '../services/kazumi.service'
           <p>
             搜索错误
           </p>
+          @if ($isApiMode()) {
+            <p>
+              该规则通过 API 搜索。请将浏览器扩展更新到支持 API 规则的最新版本后重试。
+            </p>
+          }
           <p>
             {{ searchQuery.error() | json }}
           </p>
@@ -94,7 +95,7 @@ export class SearchResultsComponent {
 
   private kazumiService = inject(KazumiService)
 
-  protected $isRunnable = computed(() => isXPathPolicy(this.policy()))
+  protected $isApiMode = computed(() => !isXPathPolicy(this.policy()))
 
   protected searchQuery = injectQuery(() =>
     this.kazumiService.getSearchQueryOptions(this.keyword(), this.policy())

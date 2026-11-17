@@ -1,3 +1,4 @@
+import 'fake-indexeddb/auto'
 import {
   createEnvironmentInjector,
   EnvironmentInjector,
@@ -13,6 +14,8 @@ import {
   provideQueryClient,
   QueryClient,
 } from '@tanstack/angular-query-experimental'
+import Dexie from 'dexie'
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { defer, finalize, from, type Observable, throwError } from 'rxjs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ExtensionMessagingService } from '../../../core/extension/extension-messaging.service'
@@ -20,11 +23,18 @@ import { queryKeys } from '../../../shared/query/queryKeys'
 import { KazumiService } from './kazumi.service'
 import { KazumiSearchPreferences } from './kazumi-search-preferences'
 
+// Dexie reads the IndexedDB API when its module is evaluated, before the fake
+// DOM API is installed. Point it at fake-indexeddb explicitly so the import
+// mutation can write to a real (in-memory) database.
+Dexie.dependencies.indexedDB = new IDBFactory()
+Dexie.dependencies.IDBKeyRange = IDBKeyRange
+
 /**
- * Importing a rule fetches its file and stores it for search. A rule the
- * scraper cannot run (api mode) must be refused with a reason the settings
- * panel can show next to that rule, and the reason must not bleed into
- * other rules or survive a retry of the same rule.
+ * Importing a rule fetches its file and stores it for search. API mode rules
+ * are stored with their request config and run through the extension, which
+ * gained API support; an xpath rule with missing selectors is still refused
+ * with a reason the settings panel can show next to that rule, and the reason
+ * must not bleed into other rules or survive a retry of the same rule.
  *
  * Searching opens a browser window per rule, so by default only the rule tabs
  * the user opens for the current keyword are searched. The "search all rules"
@@ -70,6 +80,23 @@ describe('KazumiService.addPolicyMutation', () => {
   let service: KazumiService
   const fetchMock = vi.fn<typeof fetch>()
 
+  // The service also loads the manifest list when it is constructed, so answer
+  // every request by URL instead of relying on call order.
+  function respondWithRules(rules: Record<string, unknown>) {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input)
+      const file = new URL(url).searchParams.get('file')
+      const name = file?.replace(/\.json$/, '')
+      if (name && Object.hasOwn(rules, name)) {
+        return jsonResponse(rules[name])
+      }
+      if (!url.includes('/kazumi/rules/file')) {
+        return jsonResponse([])
+      }
+      return new Response('', { status: 404 })
+    })
+  }
+
   beforeEach(() => {
     fetchMock.mockReset()
     vi.stubGlobal('fetch', fetchMock)
@@ -87,50 +114,53 @@ describe('KazumiService.addPolicyMutation', () => {
     vi.unstubAllGlobals()
   })
 
-  it('refuses an api mode rule and records why', async () => {
-    fetchMock.mockResolvedValue(jsonResponse(apiRule))
+  it('imports an api mode rule and keeps its API request config', async () => {
+    respondWithRules({ xfdmnext: apiRule })
 
     await expect(
       service.addPolicyMutation.mutateAsync('xfdmnext')
-    ).rejects.toThrow('API 模式')
+    ).resolves.toBe('xfdmnext')
 
-    const requestedUrl = String(fetchMock.mock.calls[0][0])
-    expect(requestedUrl).toContain('file=xfdmnext.json')
-    expect(service.$importErrors().get('xfdmnext')).toContain('API 模式')
+    const requestedUrls = fetchMock.mock.calls.map((call) => String(call[0]))
+    expect(requestedUrls).toContainEqual(
+      expect.stringContaining('file=xfdmnext.json')
+    )
+    expect(service.$importErrors().has('xfdmnext')).toBe(false)
     expect(service.$inProgressImports().has('xfdmnext')).toBe(false)
   })
 
   it('keeps one reason per rule', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(apiRule))
-    fetchMock.mockResolvedValueOnce(jsonResponse(brokenXPathRule))
+    respondWithRules({ xfdmnext: apiRule, broken: brokenXPathRule })
 
     await expect(
       service.addPolicyMutation.mutateAsync('xfdmnext')
-    ).rejects.toThrow()
+    ).resolves.toBe('xfdmnext')
     await expect(
       service.addPolicyMutation.mutateAsync('broken')
     ).rejects.toThrow()
 
-    expect(service.$importErrors().get('xfdmnext')).toContain('API 模式')
+    expect(service.$importErrors().has('xfdmnext')).toBe(false)
     expect(service.$importErrors().get('broken')).toBe(
       'Schema validation failed'
     )
   })
 
   it("clears the rule's reason when it is imported again", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(apiRule))
+    respondWithRules({ broken: brokenXPathRule })
     await expect(
-      service.addPolicyMutation.mutateAsync('xfdmnext')
+      service.addPolicyMutation.mutateAsync('broken')
     ).rejects.toThrow()
 
     const neverResolves = new Promise<Response>(() => undefined)
-    fetchMock.mockReturnValueOnce(neverResolves)
-    service.addPolicyMutation.mutate('xfdmnext')
+    fetchMock.mockImplementation(async (input) =>
+      String(input).includes('broken.json') ? neverResolves : jsonResponse([])
+    )
+    service.addPolicyMutation.mutate('broken')
     await vi.waitFor(() => {
-      expect(service.$inProgressImports().has('xfdmnext')).toBe(true)
+      expect(service.$inProgressImports().has('broken')).toBe(true)
     })
 
-    expect(service.$importErrors().has('xfdmnext')).toBe(false)
+    expect(service.$importErrors().has('broken')).toBe(false)
   })
 })
 
@@ -178,7 +208,7 @@ describe('KazumiService rule search', () => {
     makeXPathRule
   )
   const parsedApiRule = zKazumiPolicy.parse(apiRule)
-  const allRules = [...xpathRules, parsedApiRule]
+  const allRules = [...xpathRules]
 
   let active = 0
   let peak = 0
@@ -219,19 +249,23 @@ describe('KazumiService rule search', () => {
   // injectQuery, so the test subscribes the same way the components do. The
   // observers live in their own injector so a test can destroy them the way
   // leaving the search page does.
-  function observeAllRules() {
+  function observeRules(rules: KazumiPolicy[]) {
     const injector = createEnvironmentInjector(
       [],
       TestBed.inject(EnvironmentInjector)
     )
     runInInjectionContext(injector, () =>
-      allRules.map((policy) =>
+      rules.map((policy) =>
         injectQuery(() =>
           service.getSearchQueryOptions(service.$searchQuery(), policy)
         )
       )
     )
     return injector
+  }
+
+  function observeAllRules() {
+    return observeRules(allRules)
   }
 
   function configureTestBed() {
@@ -517,15 +551,23 @@ describe('KazumiService rule search', () => {
     )
   })
 
-  it('never searches a rule the scraper cannot run', () => {
+  it('searches an api rule now that the extension can run it', async () => {
     preferences.setSearchAllRules(true)
+    observeRules([parsedApiRule])
 
     expect(
-      service.getSearchQueryOptions('frieren', xpathRules[0]).enabled
-    ).toBe(true)
-    expect(
       service.getSearchQueryOptions('frieren', parsedApiRule).enabled
-    ).toBe(false)
+    ).toBe(true)
+
+    service.updateQuery('frieren')
+    TestBed.tick()
+    await vi.waitFor(() => {
+      expect(searched()).toEqual(['xfdmnext:frieren'])
+    })
+    finish('xfdmnext:frieren')
+    await vi.waitFor(() => {
+      expect(active).toBe(0)
+    })
   })
 
   it('waits for a keyword', () => {
