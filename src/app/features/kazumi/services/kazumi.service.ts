@@ -7,11 +7,10 @@ import {
   signal,
   untracked,
 } from '@angular/core'
-import {
-  isXPathPolicy,
-  type KazumiPolicy,
-  type MediaInfo,
-  type SetHeaderRule,
+import type {
+  KazumiPolicy,
+  MediaInfo,
+  SetHeaderRule,
 } from '@danmaku-anywhere/extension-protocol'
 import {
   injectMutation,
@@ -203,10 +202,6 @@ export class KazumiService {
       if (!policy.success) throw policy.error
       const policyData = policy.data
 
-      if (!isXPathPolicy(policyData)) {
-        throw new Error('该规则使用 API 模式，当前版本暂不支持')
-      }
-
       await this.db.transaction(
         'rw',
         this.db.policies,
@@ -356,10 +351,7 @@ export class KazumiService {
         )
       },
       queryKey: queryKeys.kazumi.search(policy.name, trimmedKeyword),
-      enabled:
-        !!trimmedKeyword &&
-        isXPathPolicy(policy) &&
-        this.isRuleSearched(policy.name),
+      enabled: !!trimmedKeyword && this.isRuleSearched(policy.name),
       staleTime: Number.POSITIVE_INFINITY,
     })
   }
